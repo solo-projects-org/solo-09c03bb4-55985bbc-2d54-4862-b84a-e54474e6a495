@@ -16,6 +16,7 @@ import threading
 from dataclasses import dataclass
 
 from . import db
+from .attribution import resolve_attribution
 from .oai_client import OAIClient, OAIError, OAIRecord
 
 logger = logging.getLogger("harvester")
@@ -41,6 +42,7 @@ class HarvestSummary:
     run_id: int
     status: str = "success"
     note: str | None = None
+    attributions_recomputed: int = 0
 
 
 def _fetch_full_window(client: OAIClient, from_date: str | None,
@@ -139,7 +141,9 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
         # 整批落库：单事务，任何异常整体回滚，半批数据不会入库
         with db.transaction(conn):
             inserted = updated = withdrawn = 0
+            batch_identifiers: list[str] = []
             for record in records:
+                batch_identifiers.append(record.identifier)
                 if record.deleted:
                     # 遇删除标记就撤下；库中不存在则落 withdrawn 墓碑
                     if db.withdraw_bib_record(
@@ -166,6 +170,9 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
                 else:
                     updated += 1
 
+            # 归属与目录、截止日一起提交：只重算本批书目及受影响下级卷册
+            recomputed = _recompute_attributions(conn, batch_identifiers)
+
             db.advance_progress(conn, until_date)
             db.finish_run(
                 conn, run_id, status="success", pages=pages,
@@ -175,9 +182,9 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
             conn.commit()
 
         logger.info(
-            "采集成功 区间=%s~%s 页=%d 取=%d 增=%d 改=%d 撤=%d 重抓=%d",
+            "采集成功 区间=%s~%s 页=%d 取=%d 增=%d 改=%d 撤=%d 重抓=%d 归属重算=%d",
             effective_from, until_date, pages, len(records),
-            inserted, updated, withdrawn, retries,
+            inserted, updated, withdrawn, retries, recomputed,
         )
         return HarvestSummary(
             from_date=effective_from or "",
@@ -189,6 +196,7 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
             withdrawn=withdrawn,
             retries=retries,
             run_id=run_id,
+            attributions_recomputed=recomputed,
         )
     except Exception as exc:
         # 失败：确保事务回滚，截止日不推进；另起事务记录失败历史
@@ -241,3 +249,22 @@ def _commit_empty_window(conn, run_id: int, from_date: str | None,
 def _first_values(dc: dict) -> dict:
     """Dublin Core 多值字段取首值落列，完整多值保留在 raw_dc。"""
     return {key: (values[0] if values else None) for key, values in dc.items()}
+
+
+def _recompute_attributions(conn, batch_identifiers: list[str]) -> int:
+    """按整批最终状态增量重算归属。
+
+    重算范围只包括：
+    1. 本批书目自身（新增/更新/撤下都可能改变 isPartOf 或在架状态）；
+    2. 以本批记录为上级的下级卷册——通过 attributions.parent_identifier
+       向下闭包反查，补采到上级后这些卷册会从“缺失/撤下”变为已归属。
+
+    不重扫全库；与书目 upsert、截止日推进在同一事务内提交。
+    返回重算条数。
+    """
+    affected = set(batch_identifiers)
+    affected |= db.find_descendant_identifiers(conn, batch_identifiers)
+    for identifier in sorted(affected):
+        result = resolve_attribution(conn, identifier)
+        db.upsert_attribution(conn, result)
+    return len(affected)

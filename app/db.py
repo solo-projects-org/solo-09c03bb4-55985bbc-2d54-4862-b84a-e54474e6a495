@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
 
 DB_PATH = os.environ.get("APP_DB_PATH", "/data/harvester.db")
+
+logger = logging.getLogger("harvester.db")
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -58,6 +61,24 @@ CREATE TABLE IF NOT EXISTS harvest_runs (
     retries         INTEGER NOT NULL DEFAULT 0,
     error           TEXT
 );
+
+-- 分卷归属：每条书目一行，随采集事务增量重算。
+-- 升级旧库时由 backfill_attributions 用现有目录补建，不触碰续采进度。
+CREATE TABLE IF NOT EXISTS attributions (
+    identifier        TEXT PRIMARY KEY,          -- 对应 bib_records.identifier
+    parent_identifier TEXT,                      -- 直接上级 OAI 标识；总目为 NULL
+    root_identifier   TEXT,                      -- 在架总目标识；未决为 NULL
+    status            TEXT NOT NULL,             -- root/resolved/parent_missing/
+                                                 -- parent_withdrawn/cycle
+    reason            TEXT,                      -- 未决/成环原因
+    chain             TEXT NOT NULL DEFAULT '[]', -- 上溯链 JSON（含起点）
+    updated_at        TEXT NOT NULL,
+    FOREIGN KEY (identifier) REFERENCES bib_records(identifier)
+);
+
+-- 按直接上级反查受影响下级（补采后只重算相关卷册，不重扫全库）
+CREATE INDEX IF NOT EXISTS idx_attributions_parent
+    ON attributions(parent_identifier);
 """
 
 
@@ -78,8 +99,17 @@ def get_connection(db_path: str | None = None) -> sqlite3.Connection:
 def init_db(db_path: str | None = None) -> None:
     conn = get_connection(db_path)
     try:
+        # 建表脚本含 IF NOT EXISTS，对旧库无副作用。
+        # 注意：sqlite3 的 executescript 会先隐式提交，不能包进显式事务。
         conn.executescript(SCHEMA_SQL)
         conn.commit()
+        # 旧库升级：用现有目录补建缺失归属，独立事务，失败只回滚补建，
+        # harvest_progress / harvest_runs 与续采进度均不改动。
+        with transaction(conn):
+            backfilled = backfill_attributions(conn)
+            conn.commit()
+        if backfilled:
+            logger.info("旧目录归属补建完成：%d 条", backfilled)
     finally:
         conn.close()
 
@@ -210,3 +240,105 @@ def insert_withdrawn_tombstone(conn: sqlite3.Connection, *, identifier: str,
         """,
         (identifier, datestamp, "{}", utc_now_iso()),
     )
+
+
+# ---------------------------------------------------------------------------
+# 分卷归属
+# ---------------------------------------------------------------------------
+
+def upsert_attribution(conn: sqlite3.Connection, result) -> None:
+    """按归属求解结果 upsert 一行 attributions。"""
+    row = result.as_row()
+    conn.execute(
+        """
+        INSERT INTO attributions (
+            identifier, parent_identifier, root_identifier, status,
+            reason, chain, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(identifier) DO UPDATE SET
+            parent_identifier = excluded.parent_identifier,
+            root_identifier   = excluded.root_identifier,
+            status            = excluded.status,
+            reason            = excluded.reason,
+            chain             = excluded.chain,
+            updated_at        = excluded.updated_at
+        """,
+        (
+            row["identifier"], row["parent_identifier"],
+            row["root_identifier"], row["status"], row["reason"],
+            row["chain"], utc_now_iso(),
+        ),
+    )
+
+
+def get_attribution(conn: sqlite3.Connection, identifier: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM attributions WHERE identifier = ?", (identifier,)
+    ).fetchone()
+
+
+def list_unresolved_attributions(conn: sqlite3.Connection, *, limit: int,
+                                 offset: int) -> list[sqlite3.Row]:
+    """未决归属（缺失/撤下/成环），供编目员筛选待补采、待更正清单。"""
+    return conn.execute(
+        """
+        SELECT * FROM attributions
+        WHERE status IN ('parent_missing', 'parent_withdrawn', 'cycle')
+        ORDER BY identifier LIMIT ? OFFSET ?
+        """,
+        (limit, offset),
+    ).fetchall()
+
+
+def find_descendant_identifiers(conn: sqlite3.Connection,
+                                identifiers: list[str]) -> set[str]:
+    """反查直接或间接以 identifiers 中任一记录为上级的卷册。
+
+    只沿已存储的 parent_identifier 关系向下闭包，不重扫全库。
+    """
+    affected: set[str] = set()
+    frontier = list(identifiers)
+    while frontier:
+        placeholders = ",".join("?" for _ in frontier)
+        rows = conn.execute(
+            f"""
+            SELECT identifier FROM attributions
+            WHERE parent_identifier IN ({placeholders})
+            """,
+            frontier,
+        ).fetchall()
+        frontier = [
+            row["identifier"] for row in rows
+            if row["identifier"] not in affected
+        ]
+        affected.update(frontier)
+    return affected
+
+
+def delete_attribution(conn: sqlite3.Connection, identifier: str) -> None:
+    """书目被清理时同步删除归属（当前采集只撤下不删除，保留以备扩展）。"""
+    conn.execute("DELETE FROM attributions WHERE identifier = ?", (identifier,))
+
+
+def backfill_attributions(conn: sqlite3.Connection) -> int:
+    """升级旧库：为缺少归属行的旧目录补建归属。
+
+    - 只 INSERT 缺失行，已计算过的归属不覆盖；
+    - 不修改 harvest_progress / harvest_runs，续采进度不变；
+    - 返回补建条数。调用方负责在同一事务内提交。
+    """
+    # 延迟导入避免 db <-> attribution 循环依赖
+    from .attribution import resolve_attribution
+
+    rows = conn.execute(
+        """
+        SELECT b.identifier FROM bib_records b
+        LEFT JOIN attributions a ON a.identifier = b.identifier
+        WHERE a.identifier IS NULL
+        ORDER BY b.identifier
+        """
+    ).fetchall()
+    for row in rows:
+        result = resolve_attribution(conn, row["identifier"])
+        upsert_attribution(conn, result)
+    return len(rows)

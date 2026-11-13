@@ -1,6 +1,6 @@
 # 联合目录补采采集服务
 
-联合目录管理员对单馆书目进行补采的 OAI-PMH 采集服务。核心保证：**翻页失败绝不让半批记录入库**。
+联合目录管理员对单馆书目进行补采的 OAI-PMH 采集服务。核心保证：**翻页失败绝不让半批记录入库**；分卷可能比总目先采到，服务同时提供**分卷归属查询**，按卷册 OAI 标识逐级求解所属在架总目，或给出需补采、请源馆更正的上级与原因。
 
 ## 需求与实现对照
 
@@ -15,23 +15,31 @@
 | 遇删除标记就撤下 | header `status=deleted` 的记录置为 `withdrawn`（库中不存在则写墓碑） |
 | 整批采完才提交书目变更和截止日 | 单事务 `BEGIN IMMEDIATE`，全部页取完才写库并提交；异常整体回滚 |
 | 无匹配也推进截止日 | `noRecordsMatch` 不写书目，同事务推进 `last_until` |
+| 源馆在 dc:relation 多值中至多一项 `isPartOf: <OAI 标识>` 声明上级 | 只取首个 `isPartOf:` 前缀项（大小写不敏感），其余 relation 值忽略；未声明上级的在架书目视为总目 |
+| 逐级归属到在架总目返回总目标识 | `GET /api/v1/attribution/{identifier}` 返回 `root_identifier` 与完整上溯链 |
+| 上级缺失、撤下、引用成环返回原因和相关标识 | 状态 `parent_missing` / `parent_withdrawn` / `cycle`，附 `reason`、`parent_identifier`、`chain` |
+| 归属存入 SQLite，升级时用旧目录补建，不改续采进度 | 新表 `attributions`；`init_db` 仅对缺失行补建，`harvest_progress` 不触碰 |
+| 补采只重算本批书目及受影响下级卷册，不重扫全库 | 本批标识 + 沿 `parent_identifier` 向下闭包反查的下级，在采集事务内重算 |
+| 归属与目录、截止日一起提交，失败都不变 | 归属重算位于采集事务内，异常整体回滚，截止日与归属均保持旧值 |
+| 未决归属清单（待补采/待更正） | `GET /api/v1/attributions/unresolved` |
 | Docker Compose 启动服务和本地分页样例源 | `docker compose up --build` 启动 `harvester-api` + `oai-source` |
-| Swagger 发起采集并查询目录和进度 | http://localhost:8000/docs |
+| Swagger 发起采集并查询目录、进度与归属 | http://localhost:8000/docs |
 
 ## 目录结构
 
 ```
 app/                  FastAPI 采集服务
-  main.py             路由（采集/目录/进度/运行历史/健康检查）
-  harvester.py        采集编排：翻页、令牌失效重抓、整批事务
+  main.py             路由（采集/目录/归属/进度/运行历史/健康检查）
+  harvester.py        采集编排：翻页、令牌失效重抓、整批事务、归属增量重算
+  attribution.py      isPartOf 解析与逐级归属求解（缺失/撤下/成环）
   oai_client.py       OAI-PMH 2.0 客户端（httpx + xml.etree）
-  db.py               SQLite 表结构与事务操作
+  db.py               SQLite 表结构、事务操作、归属读写与旧库补建
   schemas.py          Pydantic 请求/响应模型
   Dockerfile
 sample-oai/           本地分页样例 OAI-PMH 源（纯标准库）
-  server.py           27 条样例记录（rec-013 为删除记录），PAGE_SIZE=10，3 页
+  server.py           31 条样例记录（rec-013 删除），含总目/分卷层级与三类未决样例
   Dockerfile
-tests/                pytest 端到端测试（12 个用例）
+tests/                pytest 端到端测试（28 个用例）
 scripts/              辅助脚本（故障回滚演示）
 docker-compose.yml
 ```
@@ -65,7 +73,8 @@ curl -X POST http://localhost:8000/api/v1/harvest \
   "until_date": "2026-10-15",
   "pages": 2, "fetched": 15,
   "inserted": 14, "updated": 0, "withdrawn": 1,
-  "retries": 0, "run_id": 1
+  "retries": 0, "run_id": 1,
+  "attributions_recomputed": 15
 }
 ```
 
@@ -88,7 +97,57 @@ curl 'http://localhost:8000/api/v1/progress'                # 上次成功截止
 curl 'http://localhost:8000/api/v1/runs'                    # 采集运行历史
 ```
 
-### 4. 无匹配也推进截止日
+### 4. 分卷归属查询：先采分卷，再补采上级
+
+样例源中 `rec-005`/`rec-006` 是总目 `rec-028`（datestamp 10-28）的分卷。
+首轮只采到 10-15 时，分卷已在架而总目尚未采到，归属为**上级缺失**：
+
+```bash
+# 首轮：分卷先到
+curl -X POST http://localhost:8000/api/v1/harvest \
+  -H 'Content-Type: application/json' \
+  -d '{"from": "2026-10-01", "until": "2026-10-15"}'
+
+# 查分卷归属：parent_missing，给出缺失上级标识与原因
+curl http://localhost:8000/api/v1/attribution/oai:sample.lib:rec-005
+# {
+#   "identifier": "oai:sample.lib:rec-005",
+#   "record_status": "active",
+#   "status": "parent_missing",
+#   "root_identifier": null,
+#   "parent_identifier": "oai:sample.lib:rec-028",
+#   "reason": "上级 oai:sample.lib:rec-028 本地缺失，需补采该总目或请源馆更正",
+#   "chain": ["oai:sample.lib:rec-005", "oai:sample.lib:rec-028"]
+# }
+
+# 编目员看待处理清单（缺失/撤下/成环）
+curl http://localhost:8000/api/v1/attributions/unresolved
+
+# 补采上级（不传 from，自动从上次截止日续采）
+curl -X POST http://localhost:8000/api/v1/harvest \
+  -H 'Content-Type: application/json' \
+  -d '{"until": "2026-10-29"}'
+
+# 再查：已归属到在架总目；本批只重算本批书目和受影响下级，不重扫全库
+curl http://localhost:8000/api/v1/attribution/oai:sample.lib:rec-005
+# {"status": "resolved", "root_identifier": "oai:sample.lib:rec-028", ...}
+```
+
+归属状态含义：
+
+| status | 含义 | 编目动作 |
+| --- | --- | --- |
+| `root` | 在架且未声明上级，自身即总目 | 无 |
+| `resolved` | 逐级上溯到在架总目 | 无，使用 `root_identifier` |
+| `parent_missing` | 上级标识本地目录不存在 | 按 `parent_identifier` 补采，或请源馆更正 |
+| `parent_withdrawn` | 上级已撤下（含删除墓碑） | 请源馆更正 isPartOf 声明 |
+| `cycle` | 上溯链引用成环 | 按 `chain`/`reason` 请源馆更正 |
+
+样例源内置的未决演示数据：`rec-009 -> rec-030`（源中不存在，缺失）、
+`rec-010 -> rec-013`（rec-013 已删除，撤下）、`rec-011 <-> rec-012`（成环）；
+多级链 `rec-008 -> rec-007 -> rec-029` 可验证逐级上溯。
+
+### 5. 无匹配也推进截止日
 
 对没有任何记录的区间发起采集，返回 `fetched=0` 且 `last_until` 照常推进。
 
@@ -101,10 +160,10 @@ curl 'http://localhost:8000/api/v1/runs'                    # 采集运行历史
 curl -X POST http://localhost:8080/admin/fail-next
 curl http://localhost:8080/admin/state
 
-# 全区间 27 条共 3 页：第 1 页取到后续页令牌失效 -> 丢弃该页 -> 原区间重抓成功
+# 全区间 31 条共 4 页：第 1 页取到后续页令牌失效 -> 丢弃该页 -> 原区间重抓成功
 curl -X POST http://localhost:8000/api/v1/harvest \
   -H 'Content-Type: application/json' \
-  -d '{"from": "2026-10-01", "until": "2026-10-27"}'
+  -d '{"from": "2026-10-01", "until": "2026-10-29"}'
 # 响应中 retries=1；运行历史与服务日志可查
 curl -X POST http://localhost:8080/admin/reset   # 清除故障开关
 ```
@@ -115,8 +174,10 @@ curl -X POST http://localhost:8080/admin/reset   # 清除故障开关
 ## 事务与一致性说明
 
 - 采集过程先在内存中收集全部页面，**不向 SQLite 写任何数据**；
-- 全部页成功后，在单个 `BEGIN IMMEDIATE` 事务内完成 upsert、撤下、截止日推进、运行历史更新；
-- 事务中任何一步失败都会 rollback，库状态回到采集前；
+- 全部页成功后，在单个 `BEGIN IMMEDIATE` 事务内完成 upsert、撤下、**归属增量重算**、截止日推进、运行历史更新；
+- 归属重算范围 = 本批书目 ∪ 以本批记录为上级的下级卷册（沿 `attributions.parent_identifier` 向下闭包），**不重扫全库**；
+- 事务中任何一步失败都会 rollback，书目、归属、截止日全部回到采集前；
+- 服务升级时 `init_db` 建新表并用旧目录补建缺失归属，独立事务、只增不覆盖，`harvest_progress` 续采进度不变；
 - 进程内互斥锁保证同一时刻只有一个采集任务，并发请求返回 `409`。
 
 ## 本地开发（无 Docker）

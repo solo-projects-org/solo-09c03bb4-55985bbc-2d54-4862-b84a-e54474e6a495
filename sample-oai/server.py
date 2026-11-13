@@ -7,6 +7,10 @@
   POST     /admin/fail-next          令下一次使用 resumptionToken 的请求返回 badResumptionToken
   POST     /admin/reset              清除故障开关与过期令牌
 
+书目层级：部分记录通过 dc:relation 多值中的 ``isPartOf: <OAI 标识>`` 声明
+上级总目（每条至多一项）；rec-028/029 总目 datestamp 晚于其分卷，可演示
+“先采分卷、再补采上级”，另含上级缺失、上级撤下、引用成环三类未决样例。
+
 环境变量：
   PAGE_SIZE   每页记录数，默认 10
   PORT        监听端口，默认 8080
@@ -43,7 +47,18 @@ BASE_URL = os.environ.get("BASE_URL", f"http://oai-source:{PORT}/oai")
 
 
 def _build_records() -> list[dict]:
-    """生成 27 条确定性的样例书目，其中 rec-013 为已删除记录。"""
+    """生成 32 条确定性的样例书目，其中 rec-013 为已删除记录。
+
+    层级结构（dc:relation 中至多一项 ``isPartOf: <OAI 标识>`` 声明上级）：
+      rec-028 总目《地方志集成》，datestamp 较晚（10-28），演示“分卷先采、
+              上级后补”；rec-005 / rec-006 为其分卷（10-05 / 10-06）。
+      rec-029 总目《多卷本通史》（10-29），rec-007 -> rec-029，多级链
+              rec-008 -> rec-007 -> rec-029。
+      rec-009 分卷声明 isPartOf 指向不存在的 rec-030 -> parent_missing。
+      rec-010 分卷指向 rec-013（已删除）-> parent_withdrawn。
+      rec-011 / rec-012 互相 isPartOf -> 引用成环（cycle）。
+    其余记录无 relation 项，即未声明上级的普通总目。
+    """
     records = []
     start = date(2026, 10, 1)
     for i in range(1, 28):
@@ -58,9 +73,63 @@ def _build_records() -> list[dict]:
                 "date": datestamp,
                 "dc_identifier": f"ISBN 978-7-0000-{i:04d}-X",
                 "type": "text",
+                "relations": _relations_for(i),
+            }
+        )
+
+    extra = [
+        # 总目：datestamp 在 27 条常规记录之后，首轮 10-01..10-15 采不到
+        (28, "地方志集成（总目）", "地方志馆"),
+        (29, "多卷本通史（总目）", "通史编委会"),
+        (30, "从未上送的总目（占位，不生成记录）", ""),
+    ]
+    for i, title, creator in extra:
+        if i == 30:
+            continue  # rec-030 故意不存在：供 parent_missing 演示
+        datestamp = (start + timedelta(days=i - 1)).isoformat()
+        records.append(
+            {
+                "identifier": f"oai:sample.lib:rec-{i:03d}",
+                "datestamp": datestamp,
+                "deleted": False,
+                "title": f"样例书目 {i:03d}：{title}",
+                "creator": creator,
+                "date": datestamp,
+                "dc_identifier": f"ISBN 978-7-0000-{i:04d}-X",
+                "type": "text",
+                "relations": [],
             }
         )
     return records
+
+
+def _relations_for(i: int) -> list[str]:
+    """构造第 i 条常规记录的 dc:relation 多值（至多一项 isPartOf）。"""
+    oai = lambda n: f"oai:sample.lib:rec-{n:03d}"
+    if i == 5:
+        # 多值 relation：只有第一项是 isPartOf，第二项是普通关联，应被忽略
+        return [
+            f"isPartOf: {oai(28)}",
+            "references: 相关参见《地方志编辑手册》",
+        ]
+    if i == 6:
+        return [f"isPartOf: {oai(28)}"]
+    if i == 7:
+        return [f"isPartOf: {oai(29)}"]
+    if i == 8:
+        # 多级链：rec-008 -> rec-007 -> rec-029
+        return [f"isPartOf: {oai(7)}"]
+    if i == 9:
+        # 上级 rec-030 在源中不存在 -> 本地缺失，需补采/更正
+        return [f"isPartOf: {oai(30)}"]
+    if i == 10:
+        # 上级 rec-013 带删除标记 -> 上级已撤下
+        return [f"isPartOf: {oai(13)}"]
+    if i == 11:
+        return [f"isPartOf: {oai(12)}"]
+    if i == 12:
+        return [f"isPartOf: {oai(11)}"]
+    return []
 
 
 RECORDS = _build_records()
@@ -177,6 +246,9 @@ def _record_element(parent: ET.Element, record: dict) -> None:
         ("type", record["type"]),
     ):
         ET.SubElement(dc_el, f"{{{DC_NS}}}{tag}").text = value
+    # dc:relation 多值：至多一项 isPartOf: <OAI 标识> 声明上级
+    for relation in record.get("relations", []):
+        ET.SubElement(dc_el, f"{{{DC_NS}}}relation").text = relation
 
 
 def _filter_records(from_date: str | None, until_date: str | None) -> list[dict]:

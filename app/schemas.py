@@ -36,6 +36,9 @@ class HarvestResponse(BaseModel):
     retries: int = Field(..., description="令牌失效后按原区间重抓的次数（0 或 1）")
     run_id: int
     note: str | None = None
+    attributions_recomputed: int = Field(
+        0, description="本批触发重算的归属条数（本批书目 + 受影响下级卷册）"
+    )
 
 
 class ProgressResponse(BaseModel):
@@ -70,3 +73,39 @@ class RunOut(BaseModel):
     withdrawn: int
     retries: int
     error: str | None
+
+
+class AttributionOut(BaseModel):
+    identifier: str = Field(..., description="被查询的卷册 OAI 标识")
+    record_status: str = Field(
+        ..., description="书目在架状态：active / withdrawn"
+    )
+    status: str = Field(
+        ...,
+        description=(
+            "归属状态：root=自身即总目；resolved=已归属到在架总目；"
+            "parent_missing=上级本地缺失需补采；"
+            "parent_withdrawn=上级已撤下需源馆更正；cycle=引用成环"
+        ),
+    )
+    root_identifier: str | None = Field(
+        None, description="在架总目的 OAI 标识；未决时为 null"
+    )
+    parent_identifier: str | None = Field(
+        None, description="直接上级 OAI 标识；总目为 null"
+    )
+    reason: str | None = Field(None, description="未决/成环时的具体原因")
+    chain: list[str] = Field(
+        ..., description="逐级上溯链（含起点自身），成环时末尾重复环入口"
+    )
+    updated_at: str
+
+
+class UnresolvedAttributionOut(BaseModel):
+    identifier: str
+    status: str
+    parent_identifier: str | None
+    root_identifier: str | None
+    reason: str | None
+    chain: list[str]
+    updated_at: str
